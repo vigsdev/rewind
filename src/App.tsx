@@ -210,20 +210,6 @@ export function App() {
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-16">
           {/* Intro */}
           <header className="flex flex-col gap-3 pt-16">
-            <a
-              href={SITE_URL}
-              aria-label="Back to vigs.dev"
-              className="mb-4 inline-block rounded-full transition-opacity hover:opacity-80"
-            >
-              <img
-                src="/user-normal.jpg"
-                alt="Vigs"
-                width={40}
-                height={40}
-                className="size-10 rounded-full object-cover"
-              />
-            </a>
-
             <div className="flex items-center gap-3">
               <img
                 src="/rewind-icon.svg"
