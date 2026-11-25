@@ -4,6 +4,7 @@ import {
   CheckCircle2Icon,
   ClapperboardIcon,
   DownloadIcon,
+  LayersIcon,
   Loader2Icon,
   LockIcon,
   TriangleAlertIcon,
@@ -23,6 +24,13 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import {
+  AEP_VERSIONS,
+  aeLabel,
+  AepError,
+  downgradeAep,
+  readAep,
+} from "@/lib/aep"
+import {
   getProjectVersion,
   PrprojError,
   readPrproj,
@@ -32,6 +40,29 @@ import {
 import { getVersionLabel, PRPROJ_VERSIONS } from "@/lib/versions"
 
 type Status = "idle" | "reading" | "ready" | "error"
+
+// What was read from the dropped file. `version` is the Premiere schema number or the After Effects major version.
+type Project =
+  | { kind: "prproj"; version: number; xml: string }
+  | { kind: "aep"; version: number; bytes: Uint8Array; plugins: string[] }
+
+interface Option {
+  value: number
+  label: string
+  /** For After Effects: opened in that version after a downgrade. */
+  tested?: boolean
+}
+
+const PREMIERE_OPTIONS: Option[] = PRPROJ_VERSIONS.map((v) => ({
+  value: v.version,
+  label: toPremiereLabel(v.label),
+}))
+
+const AE_OPTIONS: Option[] = AEP_VERSIONS.map((v) => ({
+  value: v.major,
+  label: aeLabel(v.major),
+  tested: v.tested,
+}))
 
 const SITE_URL = "https://vigs.dev"
 const STORY_URL = "https://labs.vigs.dev/rewind"
@@ -50,13 +81,37 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function buildOutputName(originalName: string, targetVersion: number) {
-  const base = originalName.replace(/\.prproj$/i, "")
-  return `${base}_v${targetVersion}.prproj`
+function buildOutputName(
+  originalName: string,
+  project: Project,
+  target: number
+) {
+  if (project.kind === "aep") {
+    return `${originalName.replace(/\.aep$/i, "")}_AE20${target}.aep`
+  }
+  return `${originalName.replace(/\.prproj$/i, "")}_v${target}.prproj`
 }
 
 function toPremiereLabel(label: string) {
   return label.replace(/^CC /, "Premiere Pro ")
+}
+
+/** Effects that need a plugin: not After Effects' own, not Cycore's (it ships with it), not presets saved in the project. */
+function pluginsOf(effects: string[]) {
+  return effects.filter(
+    (e) =>
+      !e.startsWith("ADBE ") &&
+      !e.startsWith("CC ") &&
+      !e.startsWith("CS ") &&
+      !e.startsWith("Pseudo/")
+  )
+}
+
+function kindOf(name: string): Project["kind"] | null {
+  const lower = name.toLowerCase()
+  if (lower.endsWith(".prproj")) return "prproj"
+  if (lower.endsWith(".aep")) return "aep"
+  return null
 }
 
 function SectionMarker({ children }: { children: React.ReactNode }) {
@@ -77,13 +132,8 @@ function Code({ children }: { children: React.ReactNode }) {
 
 export function App() {
   const [file, setFile] = React.useState<File | null>(null)
-  const [xml, setXml] = React.useState<string | null>(null)
-  const [detectedVersion, setDetectedVersion] = React.useState<number | null>(
-    null
-  )
-  const [targetVersion, setTargetVersion] = React.useState(
-    String(PRPROJ_VERSIONS[PRPROJ_VERSIONS.length - 1].version)
-  )
+  const [project, setProject] = React.useState<Project | null>(null)
+  const [targetVersion, setTargetVersion] = React.useState("")
   const [status, setStatus] = React.useState<Status>("idle")
   const [error, setError] = React.useState<string | null>(null)
   const [isDragging, setIsDragging] = React.useState(false)
@@ -93,26 +143,28 @@ export function App() {
   >(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
-  const detectedLabel =
-    detectedVersion !== null ? getVersionLabel(detectedVersion) : undefined
+  const options = project?.kind === "aep" ? AE_OPTIONS : PREMIERE_OPTIONS
 
-  const availableVersions = React.useMemo(() => {
-    if (detectedVersion === null) return PRPROJ_VERSIONS
-    return PRPROJ_VERSIONS.filter((option) => option.version < detectedVersion)
-  }, [detectedVersion])
+  const detectedLabel = React.useMemo(() => {
+    if (!project) return undefined
+    if (project.kind === "aep") return aeLabel(project.version)
+    const label = getVersionLabel(project.version)
+    return label ? toPremiereLabel(label) : undefined
+  }, [project])
 
-  const noOlderVersions = status === "ready" && availableVersions.length === 0
+  const availableOptions = React.useMemo(() => {
+    if (!project) return options
+    return options.filter((option) => option.value < project.version)
+  }, [project, options])
 
-  React.useEffect(() => {
-    if (status === "ready" && availableVersions.length > 0) {
-      setTargetVersion(String(availableVersions[0].version))
-    }
-  }, [status, availableVersions])
+  const noOlderVersions = status === "ready" && availableOptions.length === 0
+  const target = availableOptions.find(
+    (option) => String(option.value) === targetVersion
+  )
 
   const reset = React.useCallback(() => {
     setFile(null)
-    setXml(null)
-    setDetectedVersion(null)
+    setProject(null)
     setStatus("idle")
     setError(null)
     setIsDownloading(false)
@@ -120,55 +172,78 @@ export function App() {
   }, [])
 
   const handleFile = React.useCallback(async (nextFile: File) => {
-    if (!nextFile.name.toLowerCase().endsWith(".prproj")) {
-      setFile(nextFile)
-      setXml(null)
-      setDetectedVersion(null)
+    const kind = kindOf(nextFile.name)
+    setFile(nextFile)
+    setProject(null)
+    setDownloadedFileName(null)
+
+    if (!kind) {
       setStatus("error")
-      setError("That doesn't look like a .prproj file. Try another one.")
+      setError(
+        "That's not a .prproj or an .aep. Rewind only speaks Premiere and After Effects."
+      )
       return
     }
 
-    setFile(nextFile)
     setStatus("reading")
     setError(null)
-    setDownloadedFileName(null)
 
     try {
-      const text = await readPrproj(nextFile)
-      const version = getProjectVersion(text)
-      setXml(text)
-      setDetectedVersion(version)
+      let next: Project
+      if (kind === "prproj") {
+        const xml = await readPrproj(nextFile)
+        next = { kind, xml, version: getProjectVersion(xml) }
+      } else {
+        const aep = await readAep(nextFile)
+        next = {
+          kind,
+          bytes: aep.bytes,
+          version: aep.major,
+          plugins: pluginsOf(aep.facts.info.effects),
+        }
+      }
+      // Default to the newest version that's older than the project.
+      const older = (kind === "aep" ? AE_OPTIONS : PREMIERE_OPTIONS).find(
+        (option) => option.value < next.version
+      )
+      setTargetVersion(older ? String(older.value) : "")
+      setProject(next)
       setStatus("ready")
     } catch (err) {
-      setXml(null)
-      setDetectedVersion(null)
       setStatus("error")
       setError(
-        err instanceof PrprojError
+        err instanceof PrprojError || err instanceof AepError
           ? err.message
-          : "Something about this file didn't survive the trip. Try a different export of the project."
+          : "Something about this file didn't survive the trip. Try a different save of the project."
       )
     }
   }, [])
 
   const handleDownload = React.useCallback(() => {
-    if (!xml || !file || isDownloading || noOlderVersions) return
+    if (!project || !file || isDownloading || noOlderVersions) return
 
     setIsDownloading(true)
     setDownloadedFileName(null)
 
-    // Yield a tick so the "Repacking…" state actually paints before the sync gzip work runs.
+    // Yield a tick so the "Repacking…" state actually paints before the sync work runs.
     window.setTimeout(() => {
       try {
         const version = Number(targetVersion)
-        const downgradedXml = setProjectVersion(xml, version)
-        const bytes = writePrproj(downgradedXml)
-        const blob = new Blob([bytes as BlobPart], {
-          type: "application/gzip",
-        })
+        const blob =
+          project.kind === "prproj"
+            ? new Blob(
+                [
+                  writePrproj(
+                    setProjectVersion(project.xml, version)
+                  ) as BlobPart,
+                ],
+                { type: "application/gzip" }
+              )
+            : new Blob([downgradeAep(project.bytes, version) as BlobPart], {
+                type: "application/octet-stream",
+              })
         const url = URL.createObjectURL(blob)
-        const name = buildOutputName(file.name, version)
+        const name = buildOutputName(file.name, project, version)
 
         const link = document.createElement("a")
         link.href = url
@@ -180,7 +255,7 @@ export function App() {
       } catch (err) {
         setStatus("error")
         setError(
-          err instanceof PrprojError
+          err instanceof PrprojError || err instanceof AepError
             ? err.message
             : "Repacking failed, but your original file is untouched. Try again."
         )
@@ -188,7 +263,7 @@ export function App() {
         setIsDownloading(false)
       }
     }, 30)
-  }, [xml, file, targetVersion, isDownloading, noOlderVersions])
+  }, [project, file, targetVersion, isDownloading, noOlderVersions])
 
   const onInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const nextFile = event.target.files?.[0]
@@ -202,6 +277,8 @@ export function App() {
     const nextFile = event.dataTransfer.files?.[0]
     if (nextFile) void handleFile(nextFile)
   }
+
+  const FileIcon = project?.kind === "aep" ? LayersIcon : ClapperboardIcon
 
   return (
     <>
@@ -222,28 +299,28 @@ export function App() {
                 <h1 className="text-[26px] leading-8 font-medium tracking-[-0.025em] text-foreground/90">
                   Rewind
                 </h1>
-                <p className="text-[13px] leading-[18px] text-foreground/70 italic">
-                  Web Tool · Premiere Pro
+                <p className="text-[13px] leading-[18px] text-foreground/70">
+                  Web Tool · Premiere Pro · After Effects
                 </p>
               </div>
             </div>
 
             <div className="flex flex-col gap-3 pt-2 text-[15px] leading-6 text-muted-foreground">
-              <p className="text-foreground">
-                Premiere project stuck in the future?
-              </p>
+              <p className="text-foreground">Project stuck in the future?</p>
               <p>
-                Rewind downgrades <Code>.prproj</Code> files so you can try
-                opening them in an older version of Premiere Pro.
+                Rewind downgrades Premiere Pro <Code>.prproj</Code> and After
+                Effects <Code>.aep</Code> files so you can open them in an older
+                version.
               </p>
               <p>
                 No uploads. No server. Everything happens locally in your
                 browser.
               </p>
             </div>
-            <p className="pt-1 font-mono text-xs text-muted-foreground/70">
-              .prproj → gunzip → patch XML → gzip → .prproj
-            </p>
+            <div className="flex flex-col gap-1 pt-1 font-mono text-xs text-muted-foreground/70">
+              <p>.prproj → gunzip → patch XML → gzip → .prproj</p>
+              <p>.aep → read chunks → patch header, drop new chunks → .aep</p>
+            </div>
           </header>
 
           {/* 01 — Upload */}
@@ -252,24 +329,24 @@ export function App() {
               <SectionMarker>01</SectionMarker>
               <h2 className={sectionHeading}>Drop your project</h2>
               <p className={label}>
-                Feed me a <Code>.prproj</Code>. Drag it here, or click like a
-                civilized person.
+                Feed me a <Code>.prproj</Code> or an <Code>.aep</Code>. Drag it
+                here, or click like a civilized person.
               </p>
             </div>
 
             <div>
               <input
                 ref={fileInputRef}
-                id="prproj-input"
+                id="project-input"
                 type="file"
-                accept=".prproj"
+                accept=".prproj,.aep"
                 className="sr-only"
                 onChange={onInputChange}
               />
 
               {!file ? (
                 <label
-                  htmlFor="prproj-input"
+                  htmlFor="project-input"
                   onDragOver={(event) => {
                     event.preventDefault()
                     setIsDragging(true)
@@ -284,28 +361,29 @@ export function App() {
                 >
                   <UploadIcon className="mb-1 size-5 text-muted-foreground" />
                   <p className="text-[15px] leading-5 font-medium">
-                    Choose a .prproj
+                    Choose a project
                   </p>
                   <p className="text-[13px] text-muted-foreground">
                     or drag and drop
                   </p>
                   <p className="mt-2 text-xs text-muted-foreground/70">
-                    .prproj only. Everything else gets politely ignored.
+                    .prproj and .aep only. Everything else gets politely
+                    ignored.
                   </p>
                 </label>
               ) : (
                 <div className="flex items-center gap-3 rounded-[24px] border border-border bg-card p-4">
-                  <ClapperboardIcon className="size-5 shrink-0 text-muted-foreground" />
+                  <FileIcon className="size-5 shrink-0 text-muted-foreground" />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-[15px] leading-5 font-medium">
                       {file.name}
                     </p>
                     <p className="text-xs text-muted-foreground tabular-nums">
                       {formatBytes(file.size)}
-                      {status === "reading" && " · Digging through the gzip…"}
+                      {status === "reading" && " · Digging through it…"}
                       {status === "ready" &&
                         detectedLabel &&
-                        ` · ${toPremiereLabel(detectedLabel)}`}
+                        ` · ${detectedLabel}`}
                       {status === "ready" &&
                         !detectedLabel &&
                         " · Unrecognized schema version"}
@@ -362,11 +440,7 @@ export function App() {
               <div>
                 <p className={label}>Detected</p>
                 <p className="mt-1 text-[15px] leading-6 font-medium">
-                  {status === "ready"
-                    ? detectedLabel
-                      ? toPremiereLabel(detectedLabel)
-                      : "Unrecognized"
-                    : "—"}
+                  {status === "ready" ? (detectedLabel ?? "Unrecognized") : "—"}
                 </p>
               </div>
 
@@ -386,21 +460,19 @@ export function App() {
                     className="w-full rounded-full sm:w-[220px]"
                   >
                     <SelectValue>
-                      {(value: string | null) => {
-                        const option = PRPROJ_VERSIONS.find(
-                          (v) => String(v.version) === value
-                        )
-                        return option ? toPremiereLabel(option.label) : value
-                      }}
+                      {(value: string | null) =>
+                        options.find((o) => String(o.value) === value)?.label ??
+                        "—"
+                      }
                     </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
-                    {availableVersions.map((option) => (
+                    {availableOptions.map((option) => (
                       <SelectItem
-                        key={option.version}
-                        value={String(option.version)}
+                        key={option.value}
+                        value={String(option.value)}
                       >
-                        {toPremiereLabel(option.label)}
+                        {option.label}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -415,13 +487,38 @@ export function App() {
               </p>
             )}
 
-            {status === "ready" && detectedVersion !== null && (
+            {status === "ready" && project?.kind === "aep" && target && (
+              <div className="flex flex-col gap-1 text-[13px] leading-[18px] text-muted-foreground">
+                {project.version - target.value > 1 && (
+                  <p>
+                    Jumping back {project.version - target.value} versions. The
+                    further back, the more likely something new gets dropped on
+                    the way.
+                  </p>
+                )}
+                {!target.tested && (
+                  <p>
+                    {target.label} hasn't been tested yet. Open it there and
+                    check before you hand it off.
+                  </p>
+                )}
+                {project.plugins.length > 0 && (
+                  <p>
+                    Uses {project.plugins.join(", ")}. Install{" "}
+                    {project.plugins.length === 1 ? "it" : "them"} in{" "}
+                    {target.label} too.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {status === "ready" && project?.kind === "prproj" && (
               <details className="text-xs text-muted-foreground/70">
                 <summary className="cursor-pointer select-none hover:text-muted-foreground">
                   Show schema numbers
                 </summary>
                 <p className="mt-1.5 tabular-nums">
-                  Project schema: {detectedVersion} → {targetVersion}
+                  Project schema: {project.version} → {targetVersion}
                 </p>
               </details>
             )}
@@ -472,7 +569,7 @@ export function App() {
 
             <ul className="space-y-1 pt-2 text-xs text-muted-foreground/70">
               <li>No terminal.</li>
-              <li>No gunzip.</li>
+              <li>No gunzip, no hex editor.</li>
               <li>
                 No hunting through XML for <Code>Version="46"</Code>.
               </li>
@@ -487,8 +584,8 @@ export function App() {
               <h2 className={sectionHeading}>Your file stays yours</h2>
             </div>
             <p className="text-[15px] leading-6 text-muted-foreground">
-              The entire process runs inside your browser. Your{" "}
-              <Code>.prproj</Code> never gets uploaded anywhere.
+              The entire process runs inside your browser. Your project never
+              gets uploaded anywhere.
             </p>
             <p className="text-[15px] leading-6 text-muted-foreground">
               Mostly because privacy is good. Also because I really do not want
@@ -506,7 +603,13 @@ export function App() {
             </div>
             <p className="mt-2 text-[13px] leading-[18px] text-muted-foreground">
               Rewind changes the version the project reports. It doesn't make
-              newer Premiere features work in an older release.
+              newer features work in an older release.
+            </p>
+            <p className="mt-2 text-[13px] leading-[18px] text-muted-foreground">
+              For After Effects, Rewind also drops the bits an older version
+              wouldn't recognize. If After Effects can save a copy for the
+              version you need (File → Save As → Save a Copy As), that's still
+              the safest way.
             </p>
             <p className="mt-2 text-[13px] leading-[18px] text-muted-foreground">
               Save a backup first.
